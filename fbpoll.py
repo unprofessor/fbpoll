@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
 import os
 import re
@@ -48,6 +47,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 ATOM_NS = "http://www.w3.org/2005/Atom"
+XHTML_NS = "http://www.w3.org/1999/xhtml"
 
 # Runs inside the rendered embed. Returns [{id, url, utime, text, images}].
 #
@@ -319,7 +319,9 @@ def localize_images(rec: dict, image_dir: Path, base_url: str) -> None:
 
 def build_feed(page: str, records: list[dict], now: str) -> bytes:
     ET.register_namespace("", ATOM_NS)
+    ET.register_namespace("xhtml", XHTML_NS)
     a = lambda tag: f"{{{ATOM_NS}}}{tag}"  # noqa: E731
+    x = lambda tag: f"{{{XHTML_NS}}}{tag}"  # noqa: E731
     page_url = page if page.startswith("http") else f"https://www.facebook.com/{page}"
 
     feed = ET.Element(a("feed"))
@@ -340,9 +342,16 @@ def build_feed(page: str, records: list[dict], now: str) -> bytes:
         if rec.get("url"):
             ET.SubElement(e, a("link"), href=rec["url"])
 
-        parts = [f"<p>{html.escape(rec.get('text', '')).replace(chr(10), '<br/>')}</p>"]
-        parts += [f'<p><img src="{html.escape(s, quote=True)}"/></p>' for s in rec.get("images", [])]
-        ET.SubElement(e, a("content"), type="html").text = "\n".join(parts)
+        # xhtml, not html: escaped html double-escapes the signed CDN URLs, and
+        # readers that unescape once request a URL Facebook rejects.
+        div = ET.SubElement(ET.SubElement(e, a("content"), type="xhtml"), x("div"))
+        p = ET.SubElement(div, x("p"))
+        first, *rest = (rec.get("text") or "").split("\n")
+        p.text = first
+        for line in rest:
+            ET.SubElement(p, x("br")).tail = line
+        for s in rec.get("images", []):
+            ET.SubElement(ET.SubElement(div, x("p")), x("img"), src=s)
 
     return ET.tostring(feed, encoding="utf-8", xml_declaration=True)
 
