@@ -166,18 +166,32 @@ def plugin_url(page: str, height: int) -> str:
     return f"{PLUGIN_URL}?{urllib.parse.urlencode(q)}"
 
 
-def scrape(page: str, height: int, scrolls: int, debug_dir: Path | None) -> list[dict]:
+def scrape(page: str, height: int, scrolls: int, debug_dir: Path | None,
+           chromium: str | None = None) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
     url = plugin_url(page, height)
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(headless=True, executable_path=chromium)
         ctx = browser.new_context(
             user_agent=USER_AGENT,
             locale="en-US",
             viewport={"width": 500, "height": height},
         )
         pg = ctx.new_page()
+        # Facebook's own script fails to mount the timeline, so capture the
+        # renderer's markup and insert it ourselves before extracting.
+        timelines: list[str] = []
+
+        def on_response(r):
+            if "/plugin/tab/renderer/" in r.url and r.ok:
+                body = r.text().removeprefix("for (;;);")
+                try:
+                    timelines.append(json.loads(body)["payload"]["content"]["markup"]["__html"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+
+        pg.on("response", on_response)
         pg.goto(url, wait_until="domcontentloaded", timeout=45_000)
         try:
             pg.wait_for_load_state("networkidle", timeout=20_000)
@@ -201,6 +215,18 @@ def scrape(page: str, height: int, scrolls: int, debug_dir: Path | None) -> list
                 el.click(timeout=1000)
             except Exception:
                 pass
+
+        if not pg.locator("[data-utime]").count():
+            pg.evaluate(
+                """(htmls) => {
+                  for (const h of htmls) {
+                    const d = document.createElement("div");
+                    d.innerHTML = h;
+                    document.body.appendChild(d);
+                  }
+                }""",
+                timelines,
+            )
 
         posts = pg.evaluate(EXTRACT_JS)
 
@@ -334,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--scrolls", type=int, default=3, help="lazy-load scroll passes (default 3)")
     ap.add_argument("--image-dir", type=Path, help="download post images here")
     ap.add_argument("--image-base-url", help="URL prefix the feed uses for --image-dir")
+    ap.add_argument("--chromium", help="browser executable to use instead of Playwright's own build")
     ap.add_argument("--debug-dir", type=Path, help="dump page.html, screenshot, extraction")
     ap.add_argument("--from-json", type=Path, help=argparse.SUPPRESS)  # testing: skip browser
     args = ap.parse_args(argv)
@@ -347,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.from_json:
         scraped = json.loads(args.from_json.read_text())
     else:
-        scraped = scrape(args.page, args.height, args.scrolls, args.debug_dir)
+        scraped = scrape(args.page, args.height, args.scrolls, args.debug_dir, args.chromium)
 
     if not scraped:
         print("error: no posts extracted; feed left unchanged "
