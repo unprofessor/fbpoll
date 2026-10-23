@@ -244,15 +244,41 @@ def scrape(page: str, height: int, scrolls: int, debug_dir: Path | None,
 # --------------------------------------------------------------------------- state
 
 def post_id(p: dict) -> str:
+    """Atom entry id for a newly seen post: its permalink, else a content hash."""
     if p.get("url"):
         return p["url"]
     # No permalink: fall back to a content hash, ignoring image URLs (they rotate).
     return "sha1:" + hashlib.sha1(p.get("text", "").encode()).hexdigest()
 
 
+def post_key(p: dict) -> str:
+    """Dedupe key. Facebook rotates pfbid permalinks for the same post, so the
+    publish timestamp (unchanged by edits) identifies a post; fall back to
+    post_id only when there is no timestamp."""
+    if p.get("utime"):
+        return f"utime:{p['utime']}"
+    return post_id(p)
+
+
+def rekey(posts: dict) -> dict:
+    """Key records by post_key, collapsing duplicates left by older versions
+    that keyed on the (rotating) permalink. The earliest-seen record keeps its
+    id and first_seen; the latest-seen one supplies url/text/images."""
+    out: dict = {}
+    for rec in sorted(posts.values(), key=lambda r: r.get("first_seen", "")):
+        k = post_key(rec)
+        if k in out:
+            out[k].update({f: rec[f] for f in ("url", "text", "images") if rec.get(f)})
+        else:
+            out[k] = rec
+    return out
+
+
 def load_state(path: Path) -> dict:
     if path.exists():
-        return json.loads(path.read_text())
+        state = json.loads(path.read_text())
+        state["posts"] = rekey(state.get("posts", {}))
+        return state
     return {"posts": {}}
 
 
@@ -268,18 +294,19 @@ def merge(state: dict, scraped: list[dict], now: str, keep: int) -> list[dict]:
     known = state["posts"]
     new = []
     for p in scraped:
-        pid = post_id(p)
-        if pid in known:
-            # Refresh text/images (edits, "See more" expansion) but keep first_seen.
-            known[pid].update({k: p[k] for k in ("text", "images", "utime") if p.get(k)})
+        key = post_key(p)
+        if key in known:
+            # Refresh url (rotated permalink), text/images (edits, "See more"
+            # expansion), but keep id and first_seen.
+            known[key].update({k: p[k] for k in ("url", "text", "images", "utime") if p.get(k)})
             continue
-        rec = {**p, "id": pid, "first_seen": now}
-        known[pid] = rec
+        rec = {**p, "id": post_id(p), "first_seen": now}
+        known[key] = rec
         new.append(rec)
 
     # Bound the state file: keep the most recent `keep` posts.
-    ordered = sorted(known.values(), key=sort_key, reverse=True)
-    state["posts"] = {r["id"]: r for r in ordered[:keep]}
+    ordered = sorted(known.items(), key=lambda kv: sort_key(kv[1]), reverse=True)
+    state["posts"] = dict(ordered[:keep])
     return new
 
 
