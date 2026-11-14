@@ -21,8 +21,9 @@ Usage:
 Exit status: 0 on success, 2 if no posts could be extracted (the feed and
 state are left untouched, so a broken run never empties your feed).
 
-Facebook markup changes without notice. The extractor avoids class names and
-keys off post timestamps / permalinks instead, but if it stops finding posts,
+Facebook markup changes without notice. Posts are read from the JSON the
+embed ships in its page source (timelinePosts) when present, else from the
+rendered DOM keyed off timestamps / permalinks; if it stops finding posts,
 run with --debug-dir and look at page.html and screenshot.png.
 """
 
@@ -148,6 +149,41 @@ EXTRACT_JS = r"""
 """
 
 
+# The current Page Plugin (PagePluginV2) ships its posts as JSON props in the
+# page source -- {"timelinePosts": [{"message", "createdTime", ...}]} -- and
+# renders them without data-utime or permalinks, so EXTRACT_JS finds nothing.
+# createdTime is the same epoch the old markup exposed as data-utime, so the
+# existing utime:<epoch> dedupe keys carry over unchanged.
+
+def parse_timeline_posts(html: str) -> list[dict]:
+    """Posts from PagePluginV2's timelinePosts prop; [] if absent or garbled."""
+    m = re.search(r'"timelinePosts"\s*:\s*', html)
+    if not m:
+        return []
+    try:
+        raw, _ = json.JSONDecoder().raw_decode(html, m.end())
+    except ValueError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    posts = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        text = (p.get("message") or "").strip()
+        images = [u for u in (p.get("albumPhotoURLs") or [p.get("photoURL")]) if u]
+        if not text and not images:
+            continue
+        utime = p.get("createdTime")
+        posts.append({
+            "url": None,  # the embed no longer exposes a permalink
+            "utime": int(utime) if isinstance(utime, (int, float)) else None,
+            "text": text,
+            "images": images,
+        })
+    return posts
+
+
 # --------------------------------------------------------------------------- scrape
 
 def plugin_url(page: str, height: int) -> str:
@@ -228,12 +264,13 @@ def scrape(page: str, height: int, scrolls: int, debug_dir: Path | None,
                 timelines,
             )
 
-        posts = pg.evaluate(EXTRACT_JS)
+        html = pg.content()
+        posts = parse_timeline_posts(html) or pg.evaluate(EXTRACT_JS)
 
         if debug_dir:
             debug_dir.mkdir(parents=True, exist_ok=True)
             (debug_dir / "url.txt").write_text(url + "\n")
-            (debug_dir / "page.html").write_text(pg.content())
+            (debug_dir / "page.html").write_text(html)
             pg.screenshot(path=str(debug_dir / "screenshot.png"), full_page=True)
             (debug_dir / "extracted.json").write_text(json.dumps(posts, indent=2))
 
