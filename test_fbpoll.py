@@ -89,5 +89,77 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(len(saved["posts"]), 1)
 
 
+def plugin_html(posts):
+    """Page Plugin markup as served since Nov 2026: posts arrive as a JSON prop
+    of PagePluginV2.react, with no data-utime or permalinks in the DOM."""
+    props = {"pageID": "100064439029478", "pageName": "Lion Surplus", "timelinePosts": posts}
+    blob = json.dumps(props).replace("/", "\\/")  # Facebook escapes slashes
+    return (
+        '<html><body><script>requireLazy(["ServerJS"],function(s){s.handle('
+        '{"require":[["react-xhp","constructAndRenderComponentIntoComment_DO_NOT_USE",'
+        '["PagePluginV2.react"],[{"props":' + blob + '}]]]})});</script></body></html>'
+    )
+
+
+PHOTO = "https://scontent-lga3-3.xx.fbcdn.net/v/t39.30808-6/1_2_n.jpg?stp=a&oh=b"
+ALBUM = [
+    "https://scontent-lga3-1.xx.fbcdn.net/v/t39.30808-6/3_4_n.jpg?x=1",
+    "https://scontent-lga3-1.xx.fbcdn.net/v/t39.30808-6/5_6_n.jpg?x=2",
+]
+
+
+def timeline_post(message, created, kind="photo", **kw):
+    p = {
+        "message": message, "createdTime": created, "attachmentType": kind,
+        "photoURL": PHOTO, "albumPhotoURLs": None, "albumPhotoCount": None,
+        "attachedStory": None, "reactionCount": 1, "commentCount": 0, "shareCount": 0,
+    }
+    p.update(kw)
+    return p
+
+
+class TimelinePostsTest(unittest.TestCase):
+    def test_extracts_text_timestamp_and_photo(self):
+        html = plugin_html([timeline_post("Bleacher seats $100", 1794577744)])
+        self.assertEqual(
+            fbpoll.parse_timeline_posts(html),
+            [{"url": None, "utime": 1794577744, "text": "Bleacher seats $100", "images": [PHOTO]}],
+        )
+
+    def test_album_uses_all_album_photos(self):
+        html = plugin_html([timeline_post("Laptops", 1794572512, "album", albumPhotoURLs=ALBUM, albumPhotoCount=4)])
+        (p,) = fbpoll.parse_timeline_posts(html)
+        self.assertEqual(p["images"], ALBUM)
+
+    def test_preserves_order_and_multiline_text(self):
+        html = plugin_html([
+            timeline_post("newest\nline two", 2),
+            timeline_post("older", 1, photoURL=None),
+        ])
+        posts = fbpoll.parse_timeline_posts(html)
+        self.assertEqual([p["utime"] for p in posts], [2, 1])
+        self.assertEqual(posts[0]["text"], "newest\nline two")
+        self.assertEqual(posts[1]["images"], [])
+
+    def test_skips_empty_posts(self):
+        html = plugin_html([timeline_post("", 3, photoURL=None)])
+        self.assertEqual(fbpoll.parse_timeline_posts(html), [])
+
+    def test_missing_or_garbled_blob_yields_nothing(self):
+        self.assertEqual(fbpoll.parse_timeline_posts("<html>old markup</html>"), [])
+        self.assertEqual(fbpoll.parse_timeline_posts('"timelinePosts":[{"message":'), [])
+        self.assertEqual(fbpoll.parse_timeline_posts('"timelinePosts":null'), [])
+
+    def test_timestamp_matches_existing_dedupe_key(self):
+        # Old DOM path keyed posts as utime:<data-utime>; createdTime is the same
+        # epoch, so posts seen before the switch must not be re-announced.
+        state = {"posts": {}}
+        fbpoll.merge(state, [post(OLD_URL, utime=1794572512)], "t1", 200)
+        scraped = fbpoll.parse_timeline_posts(plugin_html([timeline_post(FRIDAY_TEXT, 1794572512)]))
+        self.assertEqual(fbpoll.merge(state, scraped, "t2", 200), [])
+        (rec,) = state["posts"].values()
+        self.assertEqual(rec["url"], OLD_URL)  # a None url must not clobber the old link
+
+
 if __name__ == "__main__":
     unittest.main()
